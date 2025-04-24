@@ -18,7 +18,9 @@ import sys
 import time
 import torch
 from torch.nn.parallel import DataParallel, DistributedDataParallel
-
+#from detrex.projects.dino.modeling.dino import DINO
+#from detectron2.structures.image_list import ImageList
+from detectron2.utils.file_io import PathManager
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import LazyConfig, instantiate
 from detectron2.engine import (
@@ -32,6 +34,8 @@ from detectron2.engine import (
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
@@ -94,6 +98,10 @@ class Trainer(SimpleTrainer):
         If you want to do something with the data, you can wrap the dataloader.
         """
         data = next(self._data_loader_iter)
+        device = next(self.model.parameters()).device
+        for sample in data:
+            if "instances" in sample:
+                sample["instances"] = sample["instances"].to(device)
         data_time = time.perf_counter() - start
 
         """
@@ -166,11 +174,31 @@ def do_train(args, cfg):
                 ddp (dict)
     """
     model = instantiate(cfg.model)
-    logger = logging.getLogger("detectron2")
-    logger.info("Model:\n{}".format(model))
-    model.to(cfg.train.device)
+    import torch
+    import torch._dynamo
 
-    # this is an hack of train_net
+    pretrain_path = None#cfg.train.init_checkpoint
+    #cfg.train.init_checkpoint = ""
+    
+    #if pretrain_path:
+    if pretrain_path:
+        cfg.train.init_checkpoint = ""
+        real_path = PathManager.get_local_path(pretrain_path)   # <-- resolves detectron2://… for you
+        print(f"manually loading MAE weights from {real_path} → backbone.net.*")
+        raw = torch.load(real_path, map_location="cpu")
+        # maybe the MAE file stores its weights under a sub-dict; adjust if needed:
+        state_dict = raw.get("model", raw)
+        prefixed = {f"backbone.net.{k}": v for k, v in state_dict.items()}
+        missing, unexpected = model.load_state_dict(prefixed, strict=False)
+        print("manual load done; missing keys:", missing)
+        print("unexpected keys (skipped):", unexpected)
+        
+    model.to(cfg.train.device)
+    for name, param in model.named_parameters():
+       if name.startswith("backbone.net"):
+           print(f"Freezing {name}")
+           param.requires_grad = False
+    
     param_dicts = [
         {
             "params": [
@@ -214,12 +242,18 @@ def do_train(args, cfg):
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
     )
 
+    def sum_backbone(model):
+        return sum(p.sum().item() for p in model.backbone.vit.parameters())
+        
+    print(">>> backbone sum BEFORE checkpointer:", sum_backbone(model))
+    
     checkpointer = DetectionCheckpointer(
         model,
         cfg.train.output_dir,
         trainer=trainer,
     )
 
+    print(">>> backbone sum AFTER  checkpointer:", sum_backbone(model))
     trainer.register_hooks(
         [
             hooks.IterationTimer(),
