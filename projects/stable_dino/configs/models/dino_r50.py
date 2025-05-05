@@ -1,20 +1,19 @@
-import copy
 import torch.nn as nn
 
 from detectron2.modeling.backbone import ResNet, BasicStem
 from detectron2.layers import ShapeSpec
 from detectron2.config import LazyCall as L
 
-from detrex.modeling.matcher import HungarianMatcher
 from detrex.modeling.neck import ChannelMapper
 from detrex.layers import PositionEmbeddingSine
 
-from projects.dino.modeling import (
+from projects.stable_dino.modeling import (
     DINO,
-    DINOTransformerEncoder,
+    StableDINOTransformerEncoder,
     DINOTransformerDecoder,
     DINOTransformer,
-    DINOCriterion,
+    StableDINOCriterion,
+    StableDINOHungarianMatcher
 )
 
 model = L(DINO)(
@@ -47,7 +46,7 @@ model = L(DINO)(
         norm_layer=L(nn.GroupNorm)(num_groups=32, num_channels=256),
     ),
     transformer=L(DINOTransformer)(
-        encoder=L(DINOTransformerEncoder)(
+        encoder=L(StableDINOTransformerEncoder)(
             embed_dim=256,
             num_heads=8,
             feedforward_dim=2048,
@@ -56,7 +55,7 @@ model = L(DINO)(
             num_layers=6,
             post_norm=False,
             num_feature_levels="${..num_feature_levels}",
-            use_checkpoint=True
+            multi_level_fusion="dense-fusion"
         ),
         decoder=L(DINOTransformerDecoder)(
             embed_dim=256,
@@ -67,27 +66,27 @@ model = L(DINO)(
             num_layers=6,
             return_intermediate=True,
             num_feature_levels="${..num_feature_levels}",
-            use_checkpoint=True,
         ),
         num_feature_levels=4,
         two_stage_num_proposals="${..num_queries}",
     ),
     embed_dim=256,
     num_classes=1,
-    num_queries=1750,
+    num_queries=1500,
     aux_loss=True,
-    criterion=L(DINOCriterion)(
+    criterion=L(StableDINOCriterion)(
         num_classes="${..num_classes}",
-        matcher=L(HungarianMatcher)(
+        matcher=L(StableDINOHungarianMatcher)(
             cost_class=2.0,
             cost_bbox=5.0,
             cost_giou=2.0,
             cost_class_type="focal_loss_cost",
             alpha=0.25,
             gamma=2.0,
+            cec_beta=0.5,
         ),
         weight_dict={
-            "loss_class": 1,
+            "loss_class": 6.0,
             "loss_bbox": 5.0,
             "loss_giou": 2.0,
             "loss_class_dn": 1,
@@ -98,6 +97,9 @@ model = L(DINO)(
         alpha=0.25,
         gamma=2.0,
         two_stage_binary_cls=False,
+        use_ce_loss_type="stable-dino",
+        ta_alpha=0.0,
+        ta_beta=2.0,
     ),
     dn_number=100,
     label_noise_ratio=0.5,
@@ -106,19 +108,9 @@ model = L(DINO)(
     pixel_std = [54.21, 39.81, 36.52],
     #pixel_mean=[123.675, 116.280, 103.530],
     #pixel_std=[58.395, 57.120, 57.375],
-    vis_period=0,
-    select_box_nums_for_evaluation=1500,
-    input_format="RGB",
     device="cuda",
+    gdn_k=2,
+    neg_step_type='none',
+    no_img_padding=False,
+    dn_to_matching_block=False,
 )
-
-# set aux loss weight dict
-base_weight_dict = copy.deepcopy(model.criterion.weight_dict)
-if model.aux_loss:
-    weight_dict = model.criterion.weight_dict
-    aux_weight_dict = {}
-    aux_weight_dict.update({k + "_enc": v for k, v in base_weight_dict.items()})
-    for i in range(model.transformer.decoder.num_layers - 1):
-        aux_weight_dict.update({k + f"_{i}": v for k, v in base_weight_dict.items()})
-    weight_dict.update(aux_weight_dict)
-    model.criterion.weight_dict = weight_dict

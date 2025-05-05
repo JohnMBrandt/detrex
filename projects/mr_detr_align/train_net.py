@@ -36,6 +36,9 @@ from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"]="max_split_size_mb:128,garbage_collection_threshold:0.9"
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
@@ -117,6 +120,7 @@ class Trainer(SimpleTrainer):
         self.clip_grad_params = clip_grad_params
         self.accum_iters = accum_iters
         self._accum_step = 0
+        self._update_step = 0
 
     def run_step(self):
         assert self.model.training, "[Trainer] model was changed to eval mode!"
@@ -161,7 +165,10 @@ class Trainer(SimpleTrainer):
                 if self.clip_grad_params is not None:
                     self._clip_grads()
                 self.optimizer.step()
-
+            self._update_step += 1
+            if self._update_step % 100 == 0:
+                print("emptying the cache")
+                torch.cuda.empty_cache()
             self._accum_step = 0
 
         # 6) log metrics every micro-step (or you can only log on step==accum_iters-1)
@@ -239,6 +246,7 @@ def do_train(args, cfg):
                 if p.requires_grad
             ],
             "lr": 1e-4,
+            #"initial_lr": 1e-7,
         },
     ]
     optim = torch.optim.AdamW(param_dicts, lr=1e-4, weight_decay=1e-4)
@@ -267,7 +275,7 @@ def do_train(args, cfg):
         optimizer=optim,
         amp=cfg.train.amp.enabled,
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
-        accum_iters=getattr(cfg.train, "accum_iters", 3),
+        accum_iters=getattr(cfg.train, "accum_iters", 4),
     )
 
     # 6) Checkpointer
@@ -294,7 +302,7 @@ def do_train(args, cfg):
     # 8) Resume or load
     checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=args.resume)
     start_iter = trainer.iter + 1 if args.resume and checkpointer.has_checkpoint() else 0
-
+    #start_iter = 4000
     # 9) Train
     trainer.train(start_iter, cfg.train.max_iter)
 

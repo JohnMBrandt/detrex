@@ -11,7 +11,7 @@ train = get_config("common/train.py").train
 train.init_checkpoint = "/path/to/swin_large_patch4_window12_384_22kto1k.pth"
 train.output_dir = "./output/dino_swin_large_384_4scale_36ep"
 
-train.max_iter = 270000
+train.max_iter = 80000
 train.eval_period = 5000
 train.log_period = 20
 train.checkpointer.period = 5000
@@ -32,9 +32,9 @@ optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 16
+dataloader.train.num_workers = 3
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 16
+dataloader.train.total_batch_size = 3

@@ -14,7 +14,7 @@ embed_dim, depth, num_heads, dp = 768, 12, 12, 0.1
 # Creates Simple Feature Pyramid from ViT backbone
 model.backbone = L(SimpleFeaturePyramid)(
     net=L(ViT)(  # Single-scale ViT backbone
-        img_size=1024,
+        img_size=512,
         patch_size=16,
         embed_dim=embed_dim,
         depth=depth,
@@ -44,7 +44,7 @@ model.backbone = L(SimpleFeaturePyramid)(
     scale_factors=(2.0, 1.0, 0.5),  # (4.0, 2.0, 1.0, 0.5) in ViTDet
     top_block=L(LastLevelMaxPool)(),
     norm="LN",
-    square_pad=1024,
+    square_pad=512,
 )
 
 # modify neck config

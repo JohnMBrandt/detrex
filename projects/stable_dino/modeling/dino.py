@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import copy
 import math
-import numpy as np
-from typing import List, Optional
+import os
+from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,8 +27,9 @@ from detrex.utils import inverse_sigmoid
 
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
-from detectron2.utils.events import get_event_storage
-from detectron2.data.detection_utils import convert_image_to_rgb
+from detectron2.layers.nms import batched_nms
+
+from ..utils.box_ops import box_iou_pairwise, generalized_box_iou_pairwise, box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 
 
 class DINO(nn.Module):
@@ -69,18 +71,28 @@ class DINO(nn.Module):
         pixel_mean: List[float] = [123.675, 116.280, 103.530],
         pixel_std: List[float] = [58.395, 57.120, 57.375],
         aux_loss: bool = True,
-        select_box_nums_for_evaluation: int = 1500,
+        select_box_nums_for_evaluation: int = 300,
         device="cuda",
         dn_number: int = 100,
         label_noise_ratio: float = 0.2,
         box_noise_scale: float = 1.0,
-        input_format: Optional[str] = "RGB",
-        vis_period: int = 0,
+        gdn_k: int = 2,
+        neg_step_type: str = "none",
+        no_img_padding: bool = False,
+        dn_to_matching_block: bool = False,
+        dn_select_min_noise_as_pos: bool = False,
+        dn_select_1st_noise_as_pos: bool = False,
+        nms_thresh: float = -1.0,
+        dn_detach_dn2matching: bool = False,
+        watch_center_in_box: bool = False,
+        decoder_input_loss: bool = False,
+        encoder_ckpt_path: str = 'none',
     ):
         super().__init__()
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
+        self.no_img_padding = no_img_padding
 
         # define neck module
         self.neck = neck
@@ -100,12 +112,24 @@ class DINO(nn.Module):
         # where to calculate auxiliary loss in criterion
         self.aux_loss = aux_loss
         self.criterion = criterion
+        self.watch_center_in_box = watch_center_in_box
+        self.decoder_input_loss = decoder_input_loss
 
         # denoising
         self.label_enc = nn.Embedding(num_classes, embed_dim)
         self.dn_number = dn_number
         self.label_noise_ratio = label_noise_ratio
         self.box_noise_scale = box_noise_scale
+        self.gdn_k = gdn_k
+        self.neg_step_type = neg_step_type
+        assert self.neg_step_type in ["none", "multipy"] or self.neg_step_type.startswith("add"), \
+            "neg_step_type should be in ['none', 'multipy', 'add:k', 'addonce:k', 'addoncexy:k', 'addxy:k']"
+        self.dn_to_matching_block = dn_to_matching_block
+        self.dn_select_min_noise_as_pos = dn_select_min_noise_as_pos
+        self.dn_select_1st_noise_as_pos = dn_select_1st_noise_as_pos
+        if self.dn_select_1st_noise_as_pos:
+            assert self.dn_select_min_noise_as_pos, "dn_select_1st_noise_as_pos should be used with dn_select_min_noise_as_pos"
+        self.dn_detach_dn2matching = dn_detach_dn2matching
 
         # normalizer for input raw images
         self.device = device
@@ -126,7 +150,10 @@ class DINO(nn.Module):
 
         # if two-stage, the last class_embed and bbox_embed is for region proposal generation
         num_pred = transformer.decoder.num_layers + 1
-        self.class_embed = nn.ModuleList([copy.deepcopy(self.class_embed) for i in range(num_pred)])
+        num_pred_class_embed = num_pred
+        if self.decoder_input_loss:
+            num_pred_class_embed += 1
+        self.class_embed = nn.ModuleList([copy.deepcopy(self.class_embed) for i in range(num_pred_class_embed)])
         self.bbox_embed = nn.ModuleList([copy.deepcopy(self.bbox_embed) for i in range(num_pred)])
         nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
 
@@ -141,11 +168,46 @@ class DINO(nn.Module):
         # set topk boxes selected for inference
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
 
-        # the period for visualizing training samples
-        self.input_format = input_format
-        self.vis_period = vis_period
-        if vis_period > 0:
-            assert input_format is not None, "input_format is required for visualization!"
+        # nms_thresh
+        self.nms_thresh = nms_thresh
+
+
+        # aug weight dict
+        base_weight_dict = copy.deepcopy(self.criterion.weight_dict)
+        if self.aux_loss:
+            weight_dict = self.criterion.weight_dict
+            aux_weight_dict = {}
+            aux_weight_dict.update({k + "_enc": v for k, v in base_weight_dict.items()})
+            aux_length = self.transformer.decoder.num_layers - 1
+            if self.decoder_input_loss:
+                aux_length += 1
+            for i in range(aux_length):
+                aux_weight_dict.update({k + f"_{i}": v for k, v in base_weight_dict.items()})
+            weight_dict.update(aux_weight_dict)
+            self.criterion.weight_dict = weight_dict     
+        if hasattr(self.criterion, "enc_kd_loss_weight"):
+            self.criterion.weight_dict['loss_kd'] = self.criterion.enc_kd_loss_weight
+
+        # load pre-trained encoder
+        self.encoder_ckpt_path = encoder_ckpt_path
+        self.load_encoder()
+
+    def load_encoder(self):
+        if self.encoder_ckpt_path == "none":
+            return
+        if not os.path.exists(self.encoder_ckpt_path):
+            raise FileNotFoundError(f"encoder ckpt {self.encoder_ckpt_path} not found")
+        
+        print(f"Loading encoder from {self.encoder_ckpt_path} ...")
+        encoder_ckpt = torch.load(self.encoder_ckpt_path, map_location="cpu")
+        _load_res = self.load_state_dict(encoder_ckpt, strict=False)
+        print(f"Loading encoder from {self.encoder_ckpt_path} done")
+        missing_keys = _load_res.missing_keys
+        missing_keys = [k for k in missing_keys if "encoder" in k]
+        unexpected_keys = _load_res.unexpected_keys
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")
+        # import ipdb; ipdb.set_trace()
 
 
     def forward(self, batched_inputs):
@@ -175,12 +237,16 @@ class DINO(nn.Module):
         """
         images = self.preprocess_image(batched_inputs)
 
+
         if self.training:
             batch_size, _, H, W = images.tensor.shape
-            img_masks = images.tensor.new_ones(batch_size, H, W)
-            for img_id in range(batch_size):
-                img_h, img_w = batched_inputs[img_id]["instances"].image_size
-                img_masks[img_id, :img_h, :img_w] = 0
+            if self.no_img_padding:
+                img_masks = images.tensor.new_zeros(batch_size, H, W)
+            else:
+                img_masks = images.tensor.new_ones(batch_size, H, W)
+                for img_id in range(batch_size):
+                    img_h, img_w = batched_inputs[img_id]["instances"].image_size
+                    img_masks[img_id, :img_h, :img_w] = 0
         else:
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_zeros(batch_size, H, W)
@@ -219,21 +285,34 @@ class DINO(nn.Module):
         query_embeds = (input_query_label, input_query_bbox)
 
         # feed into transformer
-        (
+        (   
+            init_state,
             inter_states,
-            init_reference,
-            inter_references,
+            init_reference,  # [0..1]
+            inter_references,  # [0..1]
             enc_state,
             enc_reference,  # [0..1]
+            dn_content_query, 
+            dn_anchor_boxes, # [0..1]
+            anchors,
+            enc_outputs_class,
+            enc_outputs_coord,
+            enc_memory,
+            backbone_memory,
         ) = self.transformer(
             multi_level_feats,
             multi_level_masks,
             multi_level_position_embeddings,
             query_embeds,
             attn_masks=[attn_mask, None],
+            dn_meta=dn_meta,
         )
+        # import ipdb; ipdb.set_trace()
+
         # hack implementation for distributed training
         inter_states[0] += self.label_enc.weight[0, 0] * 0.0
+        if self.transformer.encoder_roi_pooling_layer is not None:
+            inter_states[0] += self.transformer.encoder_roi_pooling_layer.sum_parameter() * 0.0
 
         # Calculate output coordinates and classes.
         outputs_classes = []
@@ -269,23 +348,92 @@ class DINO(nn.Module):
         output = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
         if self.aux_loss:
             output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+        if self.watch_center_in_box:
+            init_boxes_list = []
+            init_boxes_list.append(init_reference)
+            init_boxes_list.extend(outputs_coord[:-1])
+            assert len(init_boxes_list) == len(outputs_coord), f"{len(init_boxes_list)} vs {len(outputs_coord)}"
+            output["init_boxes"] = init_boxes_list[-1]
+            if self.aux_loss:
+                for i in range(len(init_boxes_list) - 1):
+                    output["aux_outputs"][i]["init_boxes"] = init_boxes_list[i]
 
         # prepare two stage output
         interm_coord = enc_reference
-        interm_class = self.transformer.decoder.class_embed[-1](enc_state)
-        output["enc_outputs"] = {"pred_logits": interm_class, "pred_boxes": interm_coord}
+        interm_class = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers](enc_state)
+        output["enc_outputs"] = {
+            "pred_logits": interm_class, 
+            "pred_boxes": interm_coord,
+            "enc_outputs_class": enc_outputs_class,
+            "enc_outputs_coord": enc_outputs_coord,
+            "enc_memory": enc_memory,
+            "backbone_memory": backbone_memory,
+        }
+        if self.watch_center_in_box:
+            output["enc_outputs"]["init_boxes"] = init_reference
+
+        # encoder denoising
+        if dn_meta and dn_meta["single_padding"] > 0 and dn_anchor_boxes is not None:
+            interm_class_dn = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers](dn_content_query)
+            interm_coord_dn = dn_anchor_boxes
+            dn_meta["output_known_lbs_bboxes"]["enc_outputs"] = {"pred_logits": interm_class_dn, "pred_boxes": interm_coord_dn}
+
+        # decoder input loss
+        if self.decoder_input_loss:
+            # split dn and non-dn
+            if dn_meta is not None and dn_meta["single_padding"] > 0:
+                padding_size = dn_meta["single_padding"] * dn_meta["dn_num"]
+                decoder_content_input_dn = init_state[:, :padding_size]
+                decoder_content_input = init_state[:, padding_size:]
+            else:
+                decoder_content_input_dn = None
+                decoder_content_input = init_state
+
+            pred_class_dec_in = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers + 1](decoder_content_input)
+
+            output["aux_outputs"].insert(0, {
+                "pred_logits": pred_class_dec_in,
+                "pred_boxes": interm_coord,
+            })
+
+            if dn_meta is not None and dn_meta["single_padding"] > 0 and dn_anchor_boxes is not None:
+                pred_class_dec_in_dn = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers + 1](decoder_content_input_dn)
+                dn_meta["output_known_lbs_bboxes"]["aux_outputs"].insert(0, {
+                    "pred_logits": pred_class_dec_in_dn,
+                    "pred_boxes": interm_coord_dn,
+                })
+            else:
+                if dn_meta is not None and  "output_known_lbs_bboxes" in dn_meta and "aux_outputs" in dn_meta["output_known_lbs_bboxes"]:
+                    dn_meta["output_known_lbs_bboxes"]["aux_outputs"].insert(0, None)
+
+        if os.getenv("UNSTABLE_MATCHING", "0") == "1":
+            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            targets = self.prepare_targets(gt_instances)
+            matching_results = self.criterion(output, targets, return_matching_results=True)
+            # import ipdb; ipdb.set_trace()
+
+            res = {}
+            for layerid, (mat1, mat2) in enumerate(zip(matching_results[:-1], matching_results[1:])):
+                mat1, mat2 = mat1[0], mat2[0]
+
+                # sort mat1
+                matarg1 = mat1[1].sort()[1]
+                mat1 = [mat1[0][matarg1], mat1[1][matarg1]]
+
+                # sort mat2
+                matarg2 = mat2[1].sort()[1]
+                mat2 = [mat2[0][matarg2], mat2[1][matarg2]]
+
+                # count!
+                num_gt = mat1[0].shape[0]
+                num_match = (mat1[0] == mat2[0]).sum().item()
+                res[f"{layerid}_gt"] = num_gt
+                res[f"{layerid}_match"] = num_match
+            return res
+                
+
 
         if self.training:
-            # visualize training samples
-            if self.vis_period > 0:
-                storage = get_event_storage()
-                if storage.iter % self.vis_period == 0:
-                    box_cls = output["pred_logits"]
-                    box_pred = output["pred_boxes"]
-                    results = self.inference(box_cls, box_pred, images.image_sizes)
-                    self.visualize_training(batched_inputs, results)
-            
-            # compute loss
             loss_dict = self.criterion(output, targets, dn_meta)
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
@@ -305,30 +453,6 @@ class DINO(nn.Module):
                 r = detector_postprocess(results_per_image, height, width)
                 processed_results.append({"instances": r})
             return processed_results
-
-    def visualize_training(self, batched_inputs, results):
-        from detectron2.utils.visualizer import Visualizer
-
-        storage = get_event_storage()
-        max_vis_box = 20
-
-        for input, results_per_image in zip(batched_inputs, results):
-            img = input["image"]
-            img = convert_image_to_rgb(img.permute(1, 2, 0), self.input_format)
-            v_gt = Visualizer(img, None)
-            v_gt = v_gt.overlay_instances(boxes=input["instances"].gt_boxes)
-            anno_img = v_gt.get_image()
-            v_pred = Visualizer(img, None)
-            v_pred = v_pred.overlay_instances(
-                boxes=results_per_image.pred_boxes[:max_vis_box].tensor.detach().cpu().numpy()
-            )
-            pred_img = v_pred.get_image()
-            vis_img = np.concatenate((anno_img, pred_img), axis=1)
-            vis_img = vis_img.transpose(2, 0, 1)
-            vis_name = "Left: GT bounding boxes;  Right: Predicted boxes"
-            storage.put_image(vis_name, vis_img)
-            break  # only visualize one image in a batch
-
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -355,25 +479,40 @@ class DINO(nn.Module):
         A major difference of DINO from DN-DETR is that the author process pattern embedding pattern embedding
             in its detector
         forward function and use learnable tgt embedding, so we change this function a little bit.
+
+
+        for example, a batch input with 2 images, one have 1 gt [0], the other have 2 gt [0, 1]. gdn_k is 2. num_queries is 100.
+        the output will be:
+            input_query_label/box of img1: [0, -, 0, -, ...]. total: 2 * num_queries
+            input_query_label/box of img2: [0, 1, 0, 1, ...]. total: 2 * num_queries
+            output dn_num: 50. (100 (num_queries) / 2 (max(num_gt)))
+                note that the output dn_number is not the same as the input dn_number, which is 100.
+            output single_padding: 4. (2 (max(num_gt)) * 2 (gdn_k))
+
         :param dn_args: targets, dn_number, label_noise_ratio, box_noise_scale
-        :param training: if it is training or inference
+        :pargit: if it is training or inference
         :param num_queries: number of queires
         :param num_classes: number of classes
         :param hidden_dim: transformer hidden dim
         :param label_enc: encode labels in dn
         :return:
         """
+        gdn_k = self.gdn_k
+        neg_step_type: str = self.neg_step_type
+        if neg_step_type.startswith("add"):
+            neg_step: float = float(neg_step_type.split(":")[-1])
+
         if dn_number <= 0:
             return None, None, None, None
             # positive and negative dn queries
-        dn_number = dn_number * 2
+        dn_number = dn_number * gdn_k
         known = [(torch.ones_like(t["labels"])).cuda() for t in targets]
         batch_size = len(known)
         known_num = [sum(k) for k in known]
         if int(max(known_num)) == 0:
             return None, None, None, None
 
-        dn_number = dn_number // (int(max(known_num) * 2))
+        dn_number = dn_number // (int(max(known_num) * gdn_k))
 
         if dn_number == 0:
             dn_number = 1
@@ -387,10 +526,10 @@ class DINO(nn.Module):
         known_indice = torch.nonzero(unmask_label + unmask_bbox)
         known_indice = known_indice.view(-1)
 
-        known_indice = known_indice.repeat(2 * dn_number, 1).view(-1)
-        known_labels = labels.repeat(2 * dn_number, 1).view(-1)
-        known_bid = batch_idx.repeat(2 * dn_number, 1).view(-1)
-        known_bboxs = boxes.repeat(2 * dn_number, 1)
+        known_indice = known_indice.repeat(gdn_k * dn_number, 1).view(-1)
+        known_labels = labels.repeat(gdn_k * dn_number, 1).view(-1)
+        known_bid = batch_idx.repeat(gdn_k * dn_number, 1).view(-1) # batch id
+        known_bboxs = boxes.repeat(gdn_k * dn_number, 1)
         known_labels_expaned = known_labels.clone()
         known_bbox_expand = known_bboxs.clone()
 
@@ -405,83 +544,165 @@ class DINO(nn.Module):
             known_labels_expaned.scatter_(0, chosen_indice, new_label)
         single_padding = int(max(known_num))
 
-        pad_size = int(single_padding * 2 * dn_number)
-        positive_idx = (
-            torch.tensor(range(len(boxes))).long().cuda().unsqueeze(0).repeat(dn_number, 1)
-        )
-        positive_idx += (torch.tensor(range(dn_number)) * len(boxes) * 2).long().cuda().unsqueeze(1)
-        positive_idx = positive_idx.flatten()
-        negative_idx = positive_idx + len(boxes)
+        # add noise to boxes
+        pad_size = int(single_padding * gdn_k * dn_number)
+        total_gt = sum(known_num).item()
+        item_idx_of_k = torch.arange(gdn_k).repeat(dn_number).repeat_interleave(total_gt).cuda()
+        # for example: single_padding is 4, gdn_k is 2, dn_number is 33
+        # bs = 2, total_gt = 5
+        # item_idx_of_k: [0, 0, 0, 0, 0, 1, 1, 1, 1, 1] x25
+        if neg_step_type.startswith("addonce"):
+            item_idx_of_k = (item_idx_of_k > 0).float()
+            # item_idx_of_k: [0, 0, 0, 0, 0, 1, 1, 1, 1, 1] x25
+        """
+        # # code in CDN
+        # positive_idx = (
+        #     torch.tensor(range(len(boxes))).long().cuda().unsqueeze(0).repeat(dn_number, 1)
+        # )
+        # positive_idx += (torch.tensor(range(dn_number)) * len(boxes) * 2).long().cuda().unsqueeze(1)
+        # positive_idx = positive_idx.flatten()
+        # negative_idx = positive_idx + len(boxes)
+        """
+        if self.dn_select_min_noise_as_pos:
+            is_pos = torch.zeros_like(item_idx_of_k).bool()
         if box_noise_scale > 0:
             known_bbox_ = torch.zeros_like(known_bboxs)
+            # convert to [x1, y1, x2, y2]
             known_bbox_[:, :2] = known_bboxs[:, :2] - known_bboxs[:, 2:] / 2
             known_bbox_[:, 2:] = known_bboxs[:, :2] + known_bboxs[:, 2:] / 2
 
+            # get diff of bbox (w/2 h/2)
             diff = torch.zeros_like(known_bboxs)
             diff[:, :2] = known_bboxs[:, 2:] / 2
             diff[:, 2:] = known_bboxs[:, 2:] / 2
 
+            # generate random noise
             rand_sign = (
                 torch.randint_like(known_bboxs, low=0, high=2, dtype=torch.float32) * 2.0 - 1.0
-            )
+            ) # [num_dn * gdn_k, 4]. -1 or 1
+            # import ipdb; ipdb.set_trace()
             rand_part = torch.rand_like(known_bboxs)
-            rand_part[negative_idx] += 1.0
+
+            # process noise scale
+            # # old code in CDN:
+            # # rand_part[negative_idx] += 1.0
+            if neg_step_type.startswith("add"):
+                if 'xy' in neg_step_type:
+                    add_noise = torch.zeros_like(rand_part)
+                    add_noise[:, :2] = item_idx_of_k[:, None].repeat(1, 2)
+                    rand_part = rand_part + add_noise
+                else:
+                    rand_part = rand_part + neg_step * item_idx_of_k[:, None]
+            elif neg_step_type == 'multipy':
+                rand_part = rand_part * (1 + item_idx_of_k[:, None])
+
+            # apply sign
             rand_part *= rand_sign
+
+            # add noise
             known_bbox_ = known_bbox_ + torch.mul(rand_part, diff).cuda() * box_noise_scale
             known_bbox_ = known_bbox_.clamp(min=0.0, max=1.0)
+
+            # convert back to [x, y, w, h]
             known_bbox_expand[:, :2] = (known_bbox_[:, :2] + known_bbox_[:, 2:]) / 2
             known_bbox_expand[:, 2:] = known_bbox_[:, 2:] - known_bbox_[:, :2]
+            known_bbox_expand = known_bbox_expand.clamp(min=0.0, max=1.0)
 
+            # select min noise as pos
+            if self.dn_select_min_noise_as_pos:
+                if self.dn_select_1st_noise_as_pos:
+                    is_pos = (item_idx_of_k == 0) # for equal to CDN
+                else:
+                    gious = generalized_box_iou_pairwise(box_cxcywh_to_xyxy(known_bbox_expand), box_cxcywh_to_xyxy(known_bboxs)) # [dn_number * gdn_k * total_gt]
+                    k_indice = gious.view(dn_number, gdn_k, total_gt).max(1)[1].flatten() # [dn_number * total_gt]
+                    tgtid_indice = torch.arange(total_gt).repeat(dn_number).cuda()
+                    group_indices = torch.arange(dn_number).repeat_interleave(total_gt).cuda() * gdn_k * total_gt
+                    final_indice = k_indice * total_gt + tgtid_indice + group_indices
+                    is_pos[final_indice] = True
+
+        # transform noised items to desired inputs
         m = known_labels_expaned.long().to("cuda")
         input_label_embed = label_enc(m)
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)
 
-        padding_label = torch.zeros(pad_size, hidden_dim).cuda()
-        padding_bbox = torch.zeros(pad_size, 4).cuda()
+        # init input_query_label and input_query_bbox
+        input_query_label = torch.zeros(pad_size, hidden_dim).cuda().repeat(batch_size, 1, 1)
+        input_query_bbox = torch.zeros(pad_size, 4).cuda().repeat(batch_size, 1, 1)
+        if self.dn_select_min_noise_as_pos:
+            dn_is_pos = torch.zeros(pad_size).bool().cuda().repeat(batch_size, 1)
 
-        input_query_label = padding_label.repeat(batch_size, 1, 1)
-        input_query_bbox = padding_bbox.repeat(batch_size, 1, 1)
-
+        # build map from indices of catted gts to indices of input_query_label (each item in bs.)
         map_known_indice = torch.tensor([]).to("cuda")
         if len(known_num):
             map_known_indice = torch.cat(
                 [torch.tensor(range(num)) for num in known_num]
-            )  # [1,2, 1,2,3]
+            )           # [0, 1, 0]
             map_known_indice = torch.cat(
-                [map_known_indice + single_padding * i for i in range(2 * dn_number)]
-            ).long()
+                [map_known_indice + single_padding * i for i in range(gdn_k * dn_number)]
+            ).long()    # [0, 1, 0, 2, 3, 2, ..., 198, 199, 198] 
+            # import ipdb; ipdb.set_trace()
+
+        # map noised inputs to input_query_label and input_query_bbox
         if len(known_bid):
             input_query_label[(known_bid.long(), map_known_indice)] = input_label_embed
             input_query_bbox[(known_bid.long(), map_known_indice)] = input_bbox_embed
-
+            # known_bid:            [0, 0, 1, 0, 0, 1, 0, 0, 1, ...]
+            # map_known_indice:     [0, 1, 0, 2, 3, 2, 4, 5, 4, ...]
+            if self.dn_select_min_noise_as_pos:
+                dn_is_pos[(known_bid.long(), map_known_indice)] = is_pos
+            
+        # build attention masks
         tgt_size = pad_size + num_queries
         attn_mask = torch.ones(tgt_size, tgt_size).to("cuda") < 0
         # match query cannot see the reconstruct
         attn_mask[pad_size:, :pad_size] = True
+        if self.dn_to_matching_block:
+            # dn query cannot see the maching query
+            attn_mask[:pad_size, pad_size:] = True
         # reconstruct cannot see each other
         for i in range(dn_number):
             if i == 0:
                 attn_mask[
-                    single_padding * 2 * i : single_padding * 2 * (i + 1),
-                    single_padding * 2 * (i + 1) : pad_size,
+                    single_padding * gdn_k * i : single_padding * gdn_k * (i + 1),
+                    single_padding * gdn_k * (i + 1) : pad_size,
                 ] = True
             if i == dn_number - 1:
                 attn_mask[
-                    single_padding * 2 * i : single_padding * 2 * (i + 1), : single_padding * i * 2
+                    single_padding * gdn_k * i : single_padding * gdn_k * (i + 1), : single_padding * i * gdn_k
                 ] = True
             else:
                 attn_mask[
-                    single_padding * 2 * i : single_padding * 2 * (i + 1),
-                    single_padding * 2 * (i + 1) : pad_size,
+                    single_padding * gdn_k * i : single_padding * gdn_k * (i + 1),
+                    single_padding * gdn_k * (i + 1) : pad_size,
                 ] = True
                 attn_mask[
-                    single_padding * 2 * i : single_padding * 2 * (i + 1), : single_padding * 2 * i
+                    single_padding * gdn_k * i : single_padding * gdn_k * (i + 1), : single_padding * gdn_k * i
                 ] = True
 
+        # build gradient detach mask
+        if self.dn_detach_dn2matching:
+            # detach dn to matching
+            dn2matching_detach_mask = torch.zeros(tgt_size, tgt_size).to("cuda").bool()
+            dn2matching_detach_mask[:pad_size, pad_size:] = True
+
+        # build dn meta
         dn_meta = {
-            "single_padding": single_padding * 2,
+            "single_padding": single_padding * gdn_k, 
+                # size of each group. for example, 
+                # [(0, 1, 2, 0, 1, 2), (0, 1, 2, 0, 1, 2)]
+                # num_gt = 3. 
+                # single_padding = group size = 6. 
+                # gdn_k = 2. (each gt repeat 2 times in each group).
             "dn_num": dn_number,
+                # dn_number is total number of groups.
+                # in this example, dn_number = 2. (2 groups)
+            "gdn_k": gdn_k,
         }
+        if self.dn_detach_dn2matching:
+            dn_meta["dn2matching_detach_mask"] = dn2matching_detach_mask
+
+        if self.dn_select_min_noise_as_pos:
+            dn_meta['dn_is_pos'] = dn_is_pos
 
         return input_query_label, input_query_bbox, attn_mask, dn_meta
 
@@ -545,7 +766,23 @@ class DINO(nn.Module):
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
             results.append(result)
+
+        # # nms for the results
+        if self.nms_thresh > 0:
+            results = self.nms(results)
+            
         return results
+
+    def nms(self, results):
+        new_results = []
+        for i, result in enumerate(results):
+            keep = batched_nms(result.pred_boxes.tensor, result.scores, result.pred_classes, self.nms_thresh)
+            new_result = Instances(result.image_size)
+            new_result.pred_boxes = Boxes(result.pred_boxes.tensor[keep])
+            new_result.scores = result.scores[keep]
+            new_result.pred_classes = result.pred_classes[keep]
+            new_results.append(new_result)
+        return new_results
 
     def prepare_targets(self, targets):
         new_targets = []

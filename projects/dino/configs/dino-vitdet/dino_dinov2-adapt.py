@@ -1,5 +1,5 @@
 from detrex.config import get_config
-from ..models.dinov2 import model
+from ..models.dinov2_adapter import model
 from detectron2.config import LazyCall as L
 import albumentations as A
 from detectron2.data import transforms as T
@@ -17,8 +17,8 @@ train = get_config("common/train.py").train
 
 
 # modify training config
-train.init_checkpoint = "/home/ubuntu/arizona-test/detrex/projects/dino/output/dino_vithuge-512-augment-2048/model_0065999.pth"
-train.output_dir = "./output/dino_vithuge-512-augment-2048"
+#train.init_checkpoint = "/home/ubuntu/arizona-test/detrex/projects/dino/output/dino_vithuge-512-augment-2048-adapt-pretrain-fix/model_0013999.pth"
+train.output_dir = "./output/dino_vithuge-512-augment-2048-adapt-pretrain-fix-highnorm"
 #train.init_weight_prefix = "backbone.net."
 
 # max training iterations
@@ -35,7 +35,7 @@ train.checkpointer.period = 2000
 
 # gradient clipping for training
 train.clip_grad.enabled = True
-train.clip_grad.params.max_norm = 0.1
+train.clip_grad.params.max_norm = 2 # 0.1
 train.clip_grad.params.norm_type = 2
 train.amp.enabled=True
 
@@ -58,7 +58,7 @@ dataloader.train.num_workers = 10
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 4
+dataloader.train.total_batch_size = 2
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
